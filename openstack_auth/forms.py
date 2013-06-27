@@ -58,6 +58,7 @@ class Login(AuthenticationForm):
             self.user_cache = authenticate(request=self.request,
                                            username=username,
                                            password=password,
+                                           unscoped_token=None,
                                            tenant=tenant,
                                            auth_url=region)
             msg = 'Login successful for user "%(username)s".' % \

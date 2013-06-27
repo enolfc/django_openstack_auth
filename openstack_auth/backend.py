@@ -55,13 +55,11 @@ class KeystoneBackend(object):
         else:
             return None
 
-    def authenticate(self, request=None, username=None, password=None,
-                     tenant=None, auth_url=None):
-        """ Authenticates a user via the Keystone Identity API. """
-        LOG.debug('Beginning user authentication for user "%s".' % username)
+    def get_unscoped_token(self, username=None, password=None,
+                           tenant=None, auth_url=None):
+        LOG.debug('Authenticating user %s against %s' % (username, auth_url))
 
         insecure = getattr(settings, 'OPENSTACK_SSL_NO_VERIFY', False)
-
         try:
             client = keystone_client.Client(username=username,
                                             password=password,
@@ -87,10 +85,18 @@ class KeystoneBackend(object):
 
         # Check expiry for our unscoped token.
         self.check_auth_expiry(unscoped_token)
+        return unscoped_token
 
+    def authenticate_from_token(self, request=None, username=None,
+                                unscoped_token=None, tenant=None,
+                                auth_url=None):
+        insecure = getattr(settings, 'OPENSTACK_SSL_NO_VERIFY', False)
         # FIXME: Log in to default tenant when the Keystone API returns it...
         # For now we list all the user's tenants and iterate through.
         try:
+            client = keystone_client.Client(token=unscoped_token,
+                                            auth_url=auth_url,
+                                            insecure=insecure)
             tenants = client.tenants.list()
         except (keystone_exceptions.ClientException,
                 keystone_exceptions.AuthorizationFailure):
@@ -106,11 +112,11 @@ class KeystoneBackend(object):
             tenant = tenants.pop()
             try:
                 client = keystone_client.Client(tenant_id=tenant.id,
-                                                token=unscoped_token.id,
+                                                token=unscoped_token,
                                                 auth_url=auth_url,
                                                 insecure=insecure)
                 token = client.tokens.authenticate(username=username,
-                                                   token=unscoped_token.id,
+                                                   token=unscoped_token,
                                                    tenant_id=tenant.id)
                 break
             except (keystone_exceptions.ClientException,
@@ -128,16 +134,52 @@ class KeystoneBackend(object):
         user = create_user_from_token(request,
                                       token,
                                       client.service_catalog.url_for())
-
         if request is not None:
-            if is_ans1_token(unscoped_token.id):
-                hashed_token = hashlib.md5(unscoped_token.id).hexdigest()
-                unscoped_token._info['token']['id'] = hashed_token
-            request.session['unscoped_token'] = unscoped_token.id
-            request.user = user
-
             # Support client caching to save on auth calls.
             setattr(request, KEYSTONE_CLIENT_ATTR, client)
+        return user
+        
+    def fill_region_tokens(self, request=None, username=None, password=None,
+                           tenant=None, auth_url=None):
+        if not password:
+            return
+        # get unscoped tokens for other regions (if we have password)
+        regions = dict(getattr(settings, "AVAILABLE_REGIONS", []))
+        for region_url in [r for r in regions if r != auth_url]:
+            try:
+                region_token = self.get_unscoped_token(username, password,
+                                                       tenant, region_url)
+                request.session['region_tokens'][region_url] = region_token.id
+            except KeystoneAuthException:
+                # just ignore regions that do not authenticate
+                pass
+            
+
+    def authenticate(self, request=None, username=None, password=None,
+                     unscoped_token=None, tenant=None, auth_url=None):
+        """ Authenticates a user via the Keystone Identity API. """
+        LOG.debug('Beginning user authentication for user "%s".' % username)
+
+        full_unscoped_token = None
+        if not unscoped_token:
+            full_unscoped_token = self.get_unscoped_token(username, password,
+                                                          tenant, auth_url)
+            unscoped_token = full_unscoped_token.id
+
+        user = self.authenticate_from_token(request, username, unscoped_token,
+                                            tenant, auth_url)
+
+        if request is not None:
+            if full_unscoped_token and is_ans1_token(unscoped_token):
+                hashed_token = hashlib.md5(unscoped_token).hexdigest()
+                full_unscoped_token._info['token']['id'] = hashed_token
+                unscoped_token = full_unscoped_token.id
+            request.session['unscoped_token'] = unscoped_token
+            request.user = user
+            request.session['region_password'] = password
+            request.session['region_tokens'] = { auth_url: unscoped_token } 
+            self.fill_region_tokens(request, username, password,
+                                    tenant, auth_url)
 
         LOG.debug('Authentication completed for user "%s".' % username)
         return user

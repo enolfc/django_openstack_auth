@@ -5,6 +5,8 @@ from threading import Thread
 from django import shortcuts
 from django.conf import settings
 from django.contrib.auth import REDIRECT_FIELD_NAME
+from django.contrib.auth import authenticate as django_auth
+from django.contrib.auth import login as django_do_login
 from django.contrib.auth.views import (login as django_login,
                                        logout_then_login as django_logout)
 from django.contrib.auth.decorators import login_required
@@ -130,19 +132,48 @@ def switch(request, tenant_id, redirect_field_name=REDIRECT_FIELD_NAME):
     return shortcuts.redirect(redirect_to)
 
 
+@login_required
 def switch_region(request, region_name,
                   redirect_field_name=REDIRECT_FIELD_NAME):
     """
     Switches the non-identity services region that is being managed
     for the scoped project.
     """
-    if region_name in request.user.available_services_regions:
-        request.session['services_region'] = region_name
-        LOG.debug('Switching services region to %s for user "%s".'
-                  % (region_name, request.user.username))
+    available_regs = getattr(settings, 'AVAILABLE_REGIONS', [])
+    region_urls = [r[0] for r in available_regs if r[1] == region_name] 
+    if not region_urls:
+        # this should never happen, just redirect
+        return django_logout(request)
+    auth_url = region_urls[0]
+    LOG.debug('Switching to %s at %s' % (region_name, auth_url))
+
+    try:
+        region_tokens = request.session['region_tokens']
+        unscoped_token = region_tokens[auth_url]
+    except KeyError:
+        return django_logout(request)
+
+    user = django_auth(request=request,
+                       username=request.user.username,
+                       password=None,
+                       unscoped_token=unscoped_token, 
+                       tenant=None,
+                       auth_url=auth_url)
+    django_do_login(request, user)
+    if not request.user.is_authenticated():
+        return django_logout(request)
+
+    set_session_from_user(request, request.user)
+    regions = dict(Login.get_region_choices())
+    region = request.user.endpoint
+    region_name = regions.get(region)
+    request.session['region_endpoint'] = region
+    request.session['region_name'] = region_name
+    request.session['region_tokens'] = region_tokens 
 
     redirect_to = request.REQUEST.get(redirect_field_name, '')
     if not is_safe_url(url=redirect_to, host=request.get_host()):
         redirect_to = settings.LOGIN_REDIRECT_URL
 
+    LOG.debug("Redirecting to %s" % redirect_to)
     return shortcuts.redirect(redirect_to)
