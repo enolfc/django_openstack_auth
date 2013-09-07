@@ -1,6 +1,7 @@
 import logging
 
 from threading import Thread
+from urlparse import urljoin
 
 from django import shortcuts
 from django.conf import settings
@@ -22,10 +23,12 @@ except ImportError:
 
 from keystoneclient.v2_0 import client as keystone_client
 from keystoneclient import exceptions as keystone_exceptions
+from keystoneclient.httpclient import HTTPClient
 
 from .forms import Login
 from .user import set_session_from_user, create_user_from_token
 
+from cas.views import _service_url, _login_url
 
 LOG = logging.getLogger(__name__)
 
@@ -177,3 +180,62 @@ def switch_region(request, region_name,
 
     LOG.debug("Redirecting to %s" % redirect_to)
     return shortcuts.redirect(redirect_to)
+
+
+def retrieve_cas_token(auth_url, insecure, ticket, service):
+    client = HTTPClient(auth_url=auth_url,
+                        insecure=insecure)
+    params = {"auth": {"casCredentials": {"ticket": ticket,
+                                          "service": service,
+                                          "server": settings.CAS_SERVER_URL}}}
+    # XXX why this does not work?
+    url = urljoin(auth_url, 'tokens')
+    resp, body = client.request(auth_url + "/tokens", 'POST', body=params)
+    return body['access']['token']['id']
+
+
+
+def _unscoped_token_login(request, auth_url, unscoped_token,
+                          region_tokens=None, 
+                          redirect_field_name=REDIRECT_FIELD_NAME):
+    user = django_auth(request=request,
+                       username=None,
+                       password=None,
+                       unscoped_token=unscoped_token, 
+                       tenant=None,
+                       auth_url=auth_url)
+    django_do_login(request, user)
+    if not request.user.is_authenticated():
+        return django_logout(request)
+
+    set_session_from_user(request, request.user)
+    regions = dict(Login.get_region_choices())
+    region = request.user.endpoint
+    region_name = regions.get(region)
+    request.session['region_endpoint'] = region
+    request.session['region_name'] = region_name
+    if region_tokens:
+        request.session['region_tokens'] = region_tokens 
+
+    redirect_to = request.REQUEST.get(redirect_field_name, '')
+    if not is_safe_url(url=redirect_to, host=request.get_host()):
+        redirect_to = settings.LOGIN_REDIRECT_URL
+
+    LOG.debug("Redirecting to %s" % redirect_to)
+    return shortcuts.redirect(redirect_to)
+
+
+
+def cas_login(request):
+    ticket = request.REQUEST.get('ticket', None)
+    service = _service_url(request, None, False)
+    if ticket:
+        LOG.debug("HERE with ticket: %s" % ticket)
+        auth_url = settings.OPENSTACK_KEYSTONE_URL
+        insecure = getattr(settings, 'OPENSTACK_SSL_NO_VERIFY', False)
+        token = retrieve_cas_token(auth_url, insecure, ticket, service)
+        return _unscoped_token_login(request, auth_url, token)
+    else:
+        # redirect to cas login url
+        return shortcuts.redirect(_login_url(service, ticket, False))
+
