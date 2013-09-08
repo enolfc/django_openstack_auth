@@ -182,17 +182,25 @@ def switch_region(request, region_name,
     return shortcuts.redirect(redirect_to)
 
 
-def retrieve_cas_token(auth_url, insecure, ticket, service):
+def _retrieve_cas_token(auth_url, insecure, ticket, service):
     client = HTTPClient(auth_url=auth_url,
                         insecure=insecure)
     params = {"auth": {"casCredentials": {"ticket": ticket,
-                                          "service": service,
-                                          "server": settings.CAS_SERVER_URL}}}
+                                          "service": service}}}
     # XXX why this does not work?
     url = urljoin(auth_url, 'tokens')
     resp, body = client.request(auth_url + "/tokens", 'POST', body=params)
     return body['access']['token']['id']
 
+
+def _retrieve_cas_url(auth_url, insecure, service):
+    client = HTTPClient(auth_url=auth_url,
+                        insecure=insecure)
+    params = {"auth": {"casCredentials": {"service": service}}}
+    # XXX why this does not work?
+    url = urljoin(auth_url, 'tokens')
+    resp, body = client.request(auth_url + "/tokens", 'POST', body=params)
+    return body['cas_login_url']
 
 
 def _unscoped_token_login(request, auth_url, unscoped_token,
@@ -229,13 +237,12 @@ def _unscoped_token_login(request, auth_url, unscoped_token,
 def cas_login(request):
     ticket = request.REQUEST.get('ticket', None)
     service = _service_url(request, None, False)
+    auth_url = settings.OPENSTACK_KEYSTONE_URL
+    insecure = getattr(settings, 'OPENSTACK_SSL_NO_VERIFY', False)
     if ticket:
-        LOG.debug("HERE with ticket: %s" % ticket)
-        auth_url = settings.OPENSTACK_KEYSTONE_URL
-        insecure = getattr(settings, 'OPENSTACK_SSL_NO_VERIFY', False)
-        token = retrieve_cas_token(auth_url, insecure, ticket, service)
+        token = _retrieve_cas_token(auth_url, insecure, ticket, service)
         return _unscoped_token_login(request, auth_url, token)
     else:
-        # redirect to cas login url
-        return shortcuts.redirect(_login_url(service, ticket, False))
-
+        return shortcuts.redirect(_retrieve_cas_url(auth_url,
+                                                    insecure,
+                                                    service))
